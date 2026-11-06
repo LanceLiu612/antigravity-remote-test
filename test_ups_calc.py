@@ -5,10 +5,18 @@ import pytest
 
 from main import compute_all_metrics, main
 from ups_calc import (
+    BTU_PER_KW_HR,
+    RATED_ACTIVE_POWER_KW,
+    RATED_CAPACITY_KVA,
+    RATED_POWER_FACTOR,
+    SPEC_EFFICIENCY_BY_LOAD_RATIO,
     calc_active_power,
     calc_apparent_power,
+    calc_heat_dissipation,
     calc_power_factor,
+    calc_power_loss,
     calc_reactive_power,
+    get_spec_efficiency,
 )
 
 
@@ -121,6 +129,67 @@ class TestCalcReactivePower:
             calc_reactive_power(-500.0, 400.0)
 
 
+class TestSpecThermalAndEfficiency:
+    """基于《UPS_Technical_Spec》(KSTAR HPM3300E-200kVA) 规格数据的热损耗与效率测试。"""
+
+    def test_rated_constants(self) -> None:
+        assert RATED_CAPACITY_KVA == 200.0
+        assert RATED_ACTIVE_POWER_KW == 200.0
+        assert RATED_POWER_FACTOR == 1.0
+        assert BTU_PER_KW_HR == 3412.142
+        assert SPEC_EFFICIENCY_BY_LOAD_RATIO == {
+            0.25: 0.950,
+            0.50: 0.965,
+            0.75: 0.962,
+            1.00: 0.960,
+        }
+
+    @pytest.mark.parametrize(
+        "load_ratio, expected_eff, expected_kw, expected_loss_kw, expected_btu_hr",
+        [
+            # 25% 负载: 50 kW, eff=95.0%, P_loss = 50 * (1/0.95 - 1) = 2.631578947... kW
+            (0.25, 0.950, 50.0, 50.0 * (1.0 / 0.950 - 1.0), 50.0 * (1.0 / 0.950 - 1.0) * 3412.142),
+            # 50% 负载: 100 kW, eff=96.5%, P_loss = 100 * (1/0.965 - 1) = 3.626943005... kW
+            (0.50, 0.965, 100.0, 100.0 * (1.0 / 0.965 - 1.0), 100.0 * (1.0 / 0.965 - 1.0) * 3412.142),
+            # 75% 负载: 150 kW, eff=96.2%, P_loss = 150 * (1/0.962 - 1) = 5.925155925... kW
+            (0.75, 0.962, 150.0, 150.0 * (1.0 / 0.962 - 1.0), 150.0 * (1.0 / 0.962 - 1.0) * 3412.142),
+            # 100% 负载: 200 kW, eff=96.0%, P_loss = 200 * (1/0.960 - 1) = 8.333333333... kW
+            (1.00, 0.960, 200.0, 200.0 * (1.0 / 0.960 - 1.0), 200.0 * (1.0 / 0.960 - 1.0) * 3412.142),
+        ],
+    )
+    def test_spec_load_points(
+        self,
+        load_ratio: float,
+        expected_eff: float,
+        expected_kw: float,
+        expected_loss_kw: float,
+        expected_btu_hr: float,
+    ) -> None:
+        eff = get_spec_efficiency(load_ratio)
+        assert math.isclose(eff, expected_eff, rel_tol=1e-9)
+
+        active_kw = calc_active_power(RATED_CAPACITY_KVA * load_ratio, RATED_POWER_FACTOR)
+        assert math.isclose(active_kw, expected_kw, rel_tol=1e-9)
+
+        loss_kw = calc_power_loss(active_kw, eff)
+        assert math.isclose(loss_kw, expected_loss_kw, rel_tol=1e-9)
+
+        heat_btu = calc_heat_dissipation(loss_kw)
+        assert math.isclose(heat_btu, expected_btu_hr, rel_tol=1e-9)
+
+    def test_invalid_efficiency_and_load_ratio(self) -> None:
+        with pytest.raises(ValueError):
+            get_spec_efficiency(0.60)
+        with pytest.raises(ValueError):
+            calc_power_loss(100.0, 0.0)
+        with pytest.raises(ValueError):
+            calc_power_loss(100.0, 1.05)
+        with pytest.raises(ValueError):
+            calc_power_loss(-10.0, 0.96)
+        with pytest.raises(ValueError):
+            calc_heat_dissipation(-1.0)
+
+
 class TestMainCLI:
     """测试 main.py 命令行工具及完整换算逻辑。"""
 
@@ -151,6 +220,33 @@ class TestMainCLI:
         assert "无功功率 (Q)  : 300.00 kVAR" in captured.out
         assert "功率因数 (PF) : 0.8000" in captured.out
 
+    def test_cli_with_load_ratio_only(self, capsys: pytest.CaptureFixture[str]) -> None:
+        exit_code = main(["--load-ratio", "0.5"])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert "视在功率 (S)  : 100.00 kVA" in captured.out
+        assert "有功功率 (P)  : 100.00 kW" in captured.out
+        assert "系统效率 (η)  : 96.50%" in captured.out
+        assert "有功损耗 (Pl) : 3.6269 kW" in captured.out
+        assert "发热量 (Heat) : 12375.64 BTU/hr" in captured.out
+
+    def test_cli_with_power_and_load_ratio(self, capsys: pytest.CaptureFixture[str]) -> None:
+        exit_code = main(["--kva", "200", "--pf", "1.0", "--load-ratio", "1.0"])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert "有功功率 (P)  : 200.00 kW" in captured.out
+        assert "系统效率 (η)  : 96.00%" in captured.out
+        assert "有功损耗 (Pl) : 8.3333 kW" in captured.out
+        assert "发热量 (Heat) : 28434.52 BTU/hr" in captured.out
+
+    def test_cli_with_power_and_efficiency(self, capsys: pytest.CaptureFixture[str]) -> None:
+        exit_code = main(["--kw", "150", "--pf", "1.0", "--efficiency", "0.962"])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert "系统效率 (η)  : 96.20%" in captured.out
+        assert "有功损耗 (Pl) : 5.9252 kW" in captured.out
+        assert "发热量 (Heat) : 20217.47 BTU/hr" in captured.out
+
     @pytest.mark.parametrize(
         "argv",
         [
@@ -159,6 +255,8 @@ class TestMainCLI:
             ["--kva", "500", "--kw", "450", "--pf", "0.9"],
             ["--kva", "500", "--pf", "1.2"],
             ["--kva", "400", "--kw", "500"],
+            ["--kva", "200", "--pf", "1.0", "--load-ratio", "0.5", "--efficiency", "0.965"],
+            ["--load-ratio", "0.33"],
         ],
     )
     def test_cli_invalid_args(
